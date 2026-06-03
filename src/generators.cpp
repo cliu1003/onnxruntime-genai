@@ -23,6 +23,7 @@
 #include "qnn/interface.h"
 #include "webgpu/interface.h"
 #include "openvino/interface.h"
+#include "morphizen_ep/interface.h"
 #include "ryzenai/interface.h"
 #include "engine/engine.h"
 
@@ -148,6 +149,8 @@ void Shutdown() {
   if (LeakTypes::Dump()) {
     std::cerr << "    Please see the documentation for the API being used to ensure proper cleanup." << std::endl;
   }
+
+  MorphiZenEPInterface::Shutdown();
 
   // Reset g_ort_globals directly (rather than through GetOrtGlobals(), which would lazily construct
   // the globals just to immediately tear them down). If genai was never initialized there is nothing
@@ -336,6 +339,9 @@ DeviceInterface* OrtGlobals::GetDeviceInterface(DeviceType type) {
       owned_interfaces_.push_back(CreateRyzenAIInterface(*env_));
       slot = owned_interfaces_.back().get();
       break;
+    case DeviceType::MorphiZenEP:
+      slot = GetMorphiZenEPInterface();
+      break;
     case DeviceType::CPU:
     default:
       owned_interfaces_.push_back(CreateCpuInterface());
@@ -364,6 +370,8 @@ std::string to_string(DeviceType device_type) {
       return "NvTensorRtRtx";
     case DeviceType::RyzenAI:
       return "RyzenAI";
+    case DeviceType::MorphiZenEP:
+      return "MorphiZenEP";
     default:
       throw std::runtime_error("Unknown device type");
   }
