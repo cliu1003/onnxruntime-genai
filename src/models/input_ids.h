@@ -76,6 +76,11 @@ struct WindowedInputIDs : public InputIDs {
   std::unique_ptr<OrtValue> total_sequence_length_;
   std::unique_ptr<OrtValue> past_sequence_length_;
   int32_t historical_num_tokens_{};
+
+  // QNN shared memory requires device allocators; other EPs use CPU tensors like WindowedPositionInputs.
+  bool use_device_input_ids_allocator_{false};
+  Ort::Allocator& InputIdsAllocator() const;
+  DeviceInterface& InputIdsDevice() const;
 };
 
 std::unique_ptr<InputIDs> CreateInputIDs(State& state);

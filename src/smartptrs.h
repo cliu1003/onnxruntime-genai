@@ -99,7 +99,7 @@ enum struct DeviceType {
   OpenVINO,
   NvTensorRtRtx,
   RyzenAI,
-  MorphiZenEP,
+  AMDGPU,
   MAX
 };
 

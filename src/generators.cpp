@@ -23,7 +23,7 @@
 #include "qnn/interface.h"
 #include "webgpu/interface.h"
 #include "openvino/interface.h"
-#include "morphizen_ep/interface.h"
+#include "amdgpu/interface.h"
 #include "ryzenai/interface.h"
 #include "engine/engine.h"
 
@@ -150,7 +150,7 @@ void Shutdown() {
     std::cerr << "    Please see the documentation for the API being used to ensure proper cleanup." << std::endl;
   }
 
-  MorphiZenEPInterface::Shutdown();
+  AMDGPUInterface::Shutdown();
 
   // Reset g_ort_globals directly (rather than through GetOrtGlobals(), which would lazily construct
   // the globals just to immediately tear them down). If genai was never initialized there is nothing
@@ -339,8 +339,8 @@ DeviceInterface* OrtGlobals::GetDeviceInterface(DeviceType type) {
       owned_interfaces_.push_back(CreateRyzenAIInterface(*env_));
       slot = owned_interfaces_.back().get();
       break;
-    case DeviceType::MorphiZenEP:
-      slot = GetMorphiZenEPInterface();
+    case DeviceType::AMDGPU:
+      slot = GetAMDGPUInterface();
       break;
     case DeviceType::CPU:
     default:
@@ -370,8 +370,8 @@ std::string to_string(DeviceType device_type) {
       return "NvTensorRtRtx";
     case DeviceType::RyzenAI:
       return "RyzenAI";
-    case DeviceType::MorphiZenEP:
-      return "MorphiZenEP";
+    case DeviceType::AMDGPU:
+      return "AMDGPU";
     default:
       throw std::runtime_error("Unknown device type");
   }
@@ -604,7 +604,7 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
       DeviceType::OpenVINO,
       DeviceType::NvTensorRtRtx,
       DeviceType::RyzenAI,
-      DeviceType::MorphiZenEP};
+      DeviceType::AMDGPU};
 
   if (search_->GetSequenceLength() != 0 &&
       std::none_of(devices_supporting_continuous_decoding.begin(), devices_supporting_continuous_decoding.end(),

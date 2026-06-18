@@ -103,12 +103,17 @@ void DefaultInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
   is_prompt_ = false;
 }
 
+Ort::Allocator& WindowedInputIDs::InputIdsAllocator() const {
+  return use_device_input_ids_allocator_ ? model_.p_device_inputs_->GetAllocator() : model_.allocator_cpu_;
+}
+
+DeviceInterface& WindowedInputIDs::InputIdsDevice() const {
+  return use_device_input_ids_allocator_ ? *model_.p_device_inputs_ : *GetDeviceInterface(DeviceType::CPU);
+}
+
 WindowedInputIDs::WindowedInputIDs(State& state) : state_{state} {
-  if (model_.p_device_inputs_->GetType() != DeviceType::QnnHtp &&
-      model_.p_device_inputs_->GetType() != DeviceType::QnnGpu &&
-      model_.p_device_inputs_->GetType() != DeviceType::CPU) {
-    throw std::runtime_error("Sliding a window over input_ids only works with either the QNN or the CPU provider.");
-  }
+  use_device_input_ids_allocator_ = model_.p_device_inputs_->GetType() == DeviceType::QnnHtp ||
+                                    model_.p_device_inputs_->GetType() == DeviceType::QnnGpu;
 
   name_ = model_.config_->model.decoder.inputs.input_ids.c_str();
 
@@ -178,13 +183,13 @@ void WindowedInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
 
     historical_num_tokens_ += get_unpadded_sequence_length(new_tokens.CpuSpan(), model_.config_->model.pad_token_id);
 
-    value_ = OrtValue::CreateTensor<int32_t>(model_.p_device_inputs_->GetAllocator(), shape_);
+    value_ = OrtValue::CreateTensor<int32_t>(InputIdsAllocator(), shape_);
 
     // new_tokens will always be padded so that it's size is a multiple of window_size_
     // new_tokens -> [0, a, b, c, d, e]
     // window_size = 3, num_windows = 2, pad_token = 0
     // window_index = 0, value_ -> [0, a, b]
-    std::copy_n(new_tokens.Span().begin(), window_size_, value_->GetTensorMutableData<int32_t>());
+    std::copy_n(new_tokens.CpuSpan().begin(), window_size_, value_->GetTensorMutableData<int32_t>());
 
     if (past_sequence_length_)
       *past_sequence_length_->GetTensorMutableData<int32_t>() += static_cast<int32_t>(window_size_);
@@ -194,7 +199,7 @@ void WindowedInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
     // new_tokens -> [a, b, c, d, e]
     // window_size = 3, num_windows = 2
     // window_index = 1, value_ -> [c, d, e]
-    std::copy_n(new_tokens.Span().begin() + window_index_ * window_size_, window_size_, value_->GetTensorMutableData<int32_t>());
+    std::copy_n(new_tokens.CpuSpan().begin() + window_index_ * window_size_, window_size_, value_->GetTensorMutableData<int32_t>());
 
     if (past_sequence_length_)
       *past_sequence_length_->GetTensorMutableData<int32_t>() += static_cast<int32_t>(window_size_);
@@ -206,10 +211,10 @@ void WindowedInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
     assert(new_tokens.size() == 1);
     if (shape_[1] != 1) {
       shape_[1] = 1;
-      value_ = OrtValue::CreateTensor<int32_t>(model_.p_device_inputs_->GetAllocator(), shape_);
+      value_ = OrtValue::CreateTensor<int32_t>(InputIdsAllocator(), shape_);
 
       if (type_ == Ort::TypeToTensorType<int64_t>) {
-        cast_value_ = OrtValue::CreateTensor<int64_t>(model_.p_device_inputs_->GetAllocator(), shape_);
+        cast_value_ = OrtValue::CreateTensor<int64_t>(InputIdsAllocator(), shape_);
       }
 
       if (past_sequence_length_)
@@ -221,7 +226,7 @@ void WindowedInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
       }
     }
 
-    value_->GetTensorMutableData<int32_t>()[0] = new_tokens.Span()[0];
+    value_->GetTensorMutableData<int32_t>()[0] = new_tokens.CpuSpan()[0];
   }
 
   if (window_index_ == num_windows_) {
@@ -232,7 +237,7 @@ void WindowedInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
   state_.inputs_[input_index_] = value_.get();
 
   if (type_ == Ort::TypeToTensorType<int64_t>) {
-    Cast(*value_, cast_value_, *model_.p_device_inputs_, type_);
+    Cast(*value_, cast_value_, InputIdsDevice(), type_);
     state_.inputs_[input_index_] = cast_value_.get();
   }
 }

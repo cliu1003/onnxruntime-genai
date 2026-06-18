@@ -1,0 +1,1078 @@
+From d9d5dd54f0fc537636b4834f2390e8dea2e0c8c4 Mon Sep 17 00:00:00 2001
+From: shoucair <shoucair@amd.com>
+Date: Wed, 3 Jun 2026 05:32:54 -0500
+Subject: [PATCH 1/5] feat: add DeviceType::MorphiZenEP for MorphiZen plugin EP
+
+Register the MorphiZen execution provider (AMD GPU plugin EP, shipped as
+onnxruntime_morphizen_ep.dll) so OGA can route models to its allocator
+and KV cache stays on GPU instead of falling back to host RAM.
+
+Mirrors the existing RyzenAI integration:
+
+- src/smartptrs.h: add DeviceType::MorphiZenEP.
+- src/morphizen_ep/{interface,session_options}.{h,cpp} (new): ported
+  from src/ryzenai/. SetupProvider filters OrtHardwareDeviceType_GPU;
+  the EP factory itself restricts to AMD GPU vendor id 0x1002.
+- src/generators.cpp: to_string()/GetDeviceInterface()/Shutdown() learn
+  the new DeviceType.
+- src/models/session_options.cpp: dispatch table maps "MorphiZenEP" to
+  MorphiZenEPExecutionProvider::AppendExecutionProvider.
+- src/models/model.cpp: device_type_names[] / device_memory_type_names[]
+  gain entries; EnsureDeviceOrtInit takes the V2 path for MorphiZenEP
+  (CreateMemoryInfo_V2 with AMD vendor id + GPU type) because
+  OrtMemoryInfo::Create only knows ORT-internal device names.
+- cmake/global_variables.cmake: add morphizen_ep/* to generator_srcs.
+
+Both past_present_share_buffer=true and =false work with this change;
+KV cache routing through the MorphiZen allocator is device-agnostic in
+DefaultKeyValueCache.
+---
+ cmake/global_variables.cmake         |   2 +
+ src/generators.cpp                   |   6 +
+ src/models/model.cpp                 |  34 +++-
+ src/models/session_options.cpp       |   2 +
+ src/morphizen_ep/interface.cpp       | 229 +++++++++++++++++++++++++++
+ src/morphizen_ep/interface.h         |  24 +++
+ src/morphizen_ep/session_options.cpp |  20 +++
+ src/morphizen_ep/session_options.h   |  16 ++
+ src/smartptrs.h                      |   1 +
+ 9 files changed, 329 insertions(+), 5 deletions(-)
+ create mode 100644 src/morphizen_ep/interface.cpp
+ create mode 100644 src/morphizen_ep/interface.h
+ create mode 100644 src/morphizen_ep/session_options.cpp
+ create mode 100644 src/morphizen_ep/session_options.h
+
+diff --git a/cmake/global_variables.cmake b/cmake/global_variables.cmake
+index 687b668a74..cbbc317e76 100644
+--- a/cmake/global_variables.cmake
++++ b/cmake/global_variables.cmake
+@@ -77,6 +77,8 @@ file(GLOB generator_srcs CONFIGURE_DEPENDS
+   "${GENERATORS_ROOT}/openvino/*.cpp"
+   "${GENERATORS_ROOT}/ryzenai/*.h"
+   "${GENERATORS_ROOT}/ryzenai/*.cpp"
++  "${GENERATORS_ROOT}/morphizen_ep/*.h"
++  "${GENERATORS_ROOT}/morphizen_ep/*.cpp"
+   "${GENERATORS_ROOT}/cuda/session_options.h"
+   "${GENERATORS_ROOT}/cuda/session_options.cpp"
+   "${GENERATORS_ROOT}/nvtensorrtrtx/*.h"
+diff --git a/src/generators.cpp b/src/generators.cpp
+index 3657810442..76daa6aa2e 100644
+--- a/src/generators.cpp
++++ b/src/generators.cpp
+@@ -23,6 +23,7 @@
+ #include "qnn/interface.h"
+ #include "webgpu/interface.h"
+ #include "openvino/interface.h"
++#include "morphizen_ep/interface.h"
+ #include "ryzenai/interface.h"
+ #include "engine/engine.h"
+ 
+@@ -122,6 +123,7 @@ void Shutdown() {
+   GetOrtGlobals().reset();  // Delete now because on process exit is too late
+ 
+   RyzenAIInterface::Shutdown();
++  MorphiZenEPInterface::Shutdown();
+ }
+ 
+ OrtEnv& GetOrtEnv() {
+@@ -254,6 +256,8 @@ std::string to_string(DeviceType device_type) {
+       return "NvTensorRtRtx";
+     case DeviceType::RyzenAI:
+       return "RyzenAI";
++    case DeviceType::MorphiZenEP:
++      return "MorphiZenEP";
+     default:
+       throw std::runtime_error("Unknown device type");
+   }
+@@ -279,6 +283,8 @@ DeviceInterface* GetDeviceInterface(DeviceType type) {
+       return GetOpenVINOInterface();
+     case DeviceType::RyzenAI:
+       return GetRyzenAIInterface();
++    case DeviceType::MorphiZenEP:
++      return GetMorphiZenEPInterface();
+   }
+ }
+ 
+diff --git a/src/models/model.cpp b/src/models/model.cpp
+index 06e0dda316..0cc5e7a768 100644
+--- a/src/models/model.cpp
++++ b/src/models/model.cpp
+@@ -400,7 +400,7 @@ void EnsureDeviceOrtInit(DeviceInterface& device, const Config& config) {
+   // This ensures memory allocated on-device for model inputs/outputs is valid for the lifetime of GenAI.
+ 
+   // Names for the device types used by 'SetProviderSessionOptions'
+-  static const char* device_type_names[] = {"CPU (Not used, see above)", "cuda", "DML", "WebGPU", "QNN", "OpenVINO (Not used, see above)", "NvTensorRtRtx", "RyzenAI"};
++  static const char* device_type_names[] = {"CPU (Not used, see above)", "cuda", "DML", "WebGPU", "QNN", "OpenVINO (Not used, see above)", "NvTensorRtRtx", "RyzenAI", "MorphiZenEP"};
+   static_assert(std::size(device_type_names) == static_cast<size_t>(DeviceType::MAX));
+ 
+   // Create an OrtSessionOptions and set the options to use the DeviceType we're using here
+@@ -418,15 +418,39 @@ void EnsureDeviceOrtInit(DeviceInterface& device, const Config& config) {
+ 
+   allocator.session_ = OrtSession::Create(GetOrtEnv(), g_trivial_model, sizeof(g_trivial_model), session_options.get());
+ 
+-  // Names for the device memory types used by 'OrtMemoryInfo::Create'
+-  static const char* device_memory_type_names[] = {"CPU (Not used, see above)", "Cuda", "DML", "WebGPU_Buf", "QnnHtpShared", "OpenVINO (Not used, see above)", "Cuda", "Cpu"};
++  // Names for the device memory types used by 'OrtMemoryInfo::Create'.
++  // The MorphiZenEP entry "MorphiZen" must match the name passed to
++  // CreateMemoryInfo_V2 by the MorphiZen EP factory when it registers
++  // its GPU OrtMemoryInfo via EpDevice_AddAllocatorInfo; otherwise OGA
++  // cannot look up the EP's allocator.
++  static const char* device_memory_type_names[] = {"CPU (Not used, see above)", "Cuda", "DML", "WebGPU_Buf", "QnnHtpShared", "OpenVINO (Not used, see above)", "Cuda", "Cpu", "MorphiZen"};
+   static_assert(std::size(device_memory_type_names) == static_cast<size_t>(DeviceType::MAX));
+ 
+   // Get the allocator from the OrtSession for the DeviceType (it's called 'AllocatorCreate' but it's really 'AllocatorGet')
+   auto name = device_memory_type_names[static_cast<int>(type)];
+   try {
+-    auto memory_info = OrtMemoryInfo::Create(name, OrtAllocatorType::OrtDeviceAllocator,
+-                                             0, OrtMemType::OrtMemTypeDefault);
++    std::unique_ptr<OrtMemoryInfo> memory_info;
++    if (type == DeviceType::MorphiZenEP) {
++      // MorphiZenEP exposes its allocator via the ORT plugin EP V2 API
++      // (CreateMemoryInfo_V2, registered through EpDevice_AddAllocatorInfo).
++      // The legacy OrtMemoryInfo::Create only knows ORT-internal device names
++      // ("Cuda", "DML", ...) and would fail with
++      // "Specified device is not supported. Try CreateMemoryInfo_V2."
++      // Use CreateMemoryInfo_V2 with the same parameters the EP factory used
++      // when registering its OrtMemoryInfo so ORT can match the allocator.
++      OrtMemoryInfo* raw = nullptr;
++      Ort::ThrowOnError(Ort::api->CreateMemoryInfo_V2(name, OrtMemoryInfoDeviceType_GPU,
++                                                      /*vendor*/ 0x1002,  // OrtDevice::VendorIds::AMD
++                                                      /*device_id*/ 0,
++                                                      OrtDeviceMemoryType_DEFAULT,
++                                                      /*alignment*/ 0,
++                                                      OrtAllocatorType::OrtDeviceAllocator,
++                                                      &raw));
++      memory_info.reset(raw);
++    } else {
++      memory_info = OrtMemoryInfo::Create(name, OrtAllocatorType::OrtDeviceAllocator,
++                                          0, OrtMemType::OrtMemTypeDefault);
++    }
+     allocator.allocator_ = Ort::Allocator::Create(*allocator.session_, *memory_info);
+   } catch (const Ort::Exception& e) {
+     // WebGPU memory type name changed from "WebGPU_Buffer" to "WebGPU_Buf" in ORT 1.24.3.
+diff --git a/src/models/session_options.cpp b/src/models/session_options.cpp
+index 4127b07108..1133bf88d5 100644
+--- a/src/models/session_options.cpp
++++ b/src/models/session_options.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "../cuda/session_options.h"
+ #include "../dml/session_options.h"
++#include "../morphizen_ep/session_options.h"
+ #include "../nvtensorrtrtx/session_options.h"
+ #include "../openvino/session_options.h"
+ #include "../qnn/session_options.h"
+@@ -153,6 +154,7 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
+       {"NvTensorRtRtx", NvTensorRtRtxExecutionProvider::AppendExecutionProvider},
+       {"OpenVINO", OpenVINOExecutionProvider::AppendExecutionProvider},
+       {"RyzenAI", RyzenAIExecutionProvider::AppendExecutionProvider},
++      {"MorphiZenEP", MorphiZenEPExecutionProvider::AppendExecutionProvider},
+       {"QNN", QNNExecutionProvider::AppendExecutionProvider},
+       {"VitisAI", VitisAIExecutionProvider::AppendExecutionProvider},
+       {"WebGPU", WebGPUExecutionProvider::AppendExecutionProvider},
+diff --git a/src/morphizen_ep/interface.cpp b/src/morphizen_ep/interface.cpp
+new file mode 100644
+index 0000000000..52770261c4
+--- /dev/null
++++ b/src/morphizen_ep/interface.cpp
+@@ -0,0 +1,229 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++//
++// Modifications Copyright(C) 2026 Advanced Micro Devices, Inc. All rights reserved.
++#include "../generators.h"
++#include "../ort_genai_c.h"
++#include "../search.h"
++#include "../models/model.h"
++#include "interface.h"
++#include <filesystem>
++#include <mutex>
++#include <span>
++
++#if !defined(_WIN32)
++#include <dlfcn.h>
++#endif
++
++namespace Generators {
++namespace MorphiZenEP {
++
++// Mirrors ryzenai/interface.cpp. The behavioural differences are:
++//   - ep_name_ matches the registration_name passed to morphizen's
++//     CreateEpFactories (== "MorphiZenEP" -- what callers like
++//     model_benchmark use with --ep_library, what genai_config.json uses
++//     as a provider name, and what session_options.cpp's dispatch table
++//     keys on).
++//   - SetupProvider filters OrtHardwareDeviceType_GPU; vendor id matching
++//     is delegated to the EP factory's GetSupportedDevicesImpl, which
++//     already restricts itself to AMD GPU vendor id 0x1002.
++//   - DeviceType::MorphiZenEP is returned from GetType().
++//   - Allocator-backed memory is treated as both host- and device-
++//     accessible (true on AMD APU iGPU; same simplification RyzenAI uses).
++static constexpr auto ep_path_env_key_ = "MORPHIZEN_EP_PATH";
++static constexpr auto ep_name_ = "MorphiZenEP";
++#if defined(_WIN32)
++static constexpr auto ep_filename_ = "onnxruntime_morphizen_ep.dll";
++#else
++static constexpr auto ep_filename_ = "libonnxruntime_morphizen_ep.so";
++#endif
++
++static Ort::Allocator* ort_allocator_{};
++
++struct Memory : DeviceBuffer {
++  Memory(size_t size) : owned_{true} {
++    size_in_bytes_ = size;
++    p_cpu_ = p_device_ = static_cast<uint8_t*>(ort_allocator_->Alloc(size_in_bytes_));
++  }
++
++  Memory(void* p, size_t size) : owned_{false} {
++    size_in_bytes_ = size;
++    p_cpu_ = p_device_ = static_cast<uint8_t*>(p);
++  }
++
++  ~Memory() override {
++    if (owned_)
++      ort_allocator_->Free(p_device_);
++  }
++
++  const char* GetType() const override { return "MorphiZenEP"; }
++
++  void AllocateCpu() override {}
++  void CopyDeviceToCpu() override {}
++  void CopyCpuToDevice() override {}
++
++  void CopyFrom(size_t begin_dest, DeviceBuffer& source, size_t begin_source, size_t size_in_bytes) override {
++    CopyThroughCpu(*this, begin_dest, source, begin_source, size_in_bytes);
++  }
++
++  void Zero() override {
++    memset(p_device_, 0, size_in_bytes_);
++  }
++
++  bool owned_;
++};
++
++struct Interface : MorphiZenEPInterface {
++  Interface() {
++    ep_path_ = ep_filename_;
++    // If the EP DLL is already loaded by the host, there is nothing to do.
++#if defined(_WIN32)
++    if (GetModuleHandleA(ep_filename_))
++      return;
++#else
++    if (dlopen(ep_filename_, RTLD_NOLOAD | RTLD_NOW))
++      return;
++#endif
++
++    std::error_code ec;
++
++    ep_path_ = GetEnv(ep_path_env_key_);
++
++#if defined(_WIN32)
++    const auto get_hmod_for_method = [](LPCVOID func) -> HMODULE {
++      MEMORY_BASIC_INFORMATION mbi;
++
++      if (VirtualQuery(func, &mbi, sizeof(mbi)) && mbi.AllocationBase)
++        return (HMODULE)mbi.AllocationBase;
++
++      return nullptr;
++    };
++
++    const auto find_next_to_module = [&](HMODULE hmod) -> std::filesystem::path {
++      wchar_t buffer[MAX_PATH + 1] = {0};
++      const auto len = sizeof(buffer) / sizeof(buffer[0]);
++
++      if (GetModuleFileNameW(hmod, buffer, len))
++        if (const auto dir = std::filesystem::path{buffer}.remove_filename(); !dir.empty())
++          if (auto path = dir / ep_filename_; std::filesystem::exists(path, ec))
++            return path;
++
++      return {};
++    };
++
++    if (ep_path_.empty())
++      // Check next to onnxruntime-genai.dll.
++      if (const auto hmod = get_hmod_for_method(GetMorphiZenEPInterface))
++        ep_path_ = find_next_to_module(hmod);
++
++    if (ep_path_.empty())
++      // Check next to onnxruntime.dll.
++      if (const auto hmod = get_hmod_for_method(Ort::api->RegisterExecutionProviderLibrary))
++        ep_path_ = find_next_to_module(hmod);
++
++    if (ep_path_.empty())
++      // Check next to the current executable.
++      if (const auto hmod = GetModuleHandleA(NULL))
++        ep_path_ = find_next_to_module(hmod);
++#endif  // _WIN32
++
++    if (ep_path_.empty())
++      // Fall back to the current working directory.
++      ep_path_ = std::filesystem::current_path(ec) / ep_filename_;
++
++    OgaRegisterExecutionProviderLibrary(ep_name_, ep_path_.string().c_str());
++  }
++
++  ~Interface() {
++    // The EP DLL releases its singletons in DllMain on unload; there is no
++    // equivalent of RyzenAI_Shutdown to call here.
++  }
++
++  void SetupProvider(OrtSessionOptions& session_options, const ProviderOptions& provider_options) override {
++    std::vector<const OrtEpDevice*> supported_devices;
++
++    {
++      const OrtEpDevice* const* devices = nullptr;
++      size_t ndevices = 0;
++
++      Ort::ThrowOnError(Ort::api->GetEpDevices(&GetOrtEnv(), &devices, &ndevices));
++
++      for (const auto& device : std::span{devices, ndevices}) {
++        if (std::string_view{ep_name_} != Ort::api->EpDevice_EpName(device))
++          continue;
++        const auto* hw = Ort::api->EpDevice_Device(device);
++        if (Ort::api->HardwareDevice_Type(hw) != OrtHardwareDeviceType_GPU)
++          continue;
++        // The morphizen factory's GetSupportedDevicesImpl already restricts
++        // itself to AMD GPU vendor id 0x1002, so any OrtEpDevice carrying
++        // our ep_name is by construction an AMD GPU. We deliberately do
++        // not re-check the vendor id here so the factory can broaden its
++        // device list in future without us having to update this filter
++        // in lockstep.
++        supported_devices.push_back(device);
++      }
++    }
++
++    if (supported_devices.empty())
++      throw std::runtime_error{"No MorphiZenEP-supported AMD GPU devices detected"};
++
++    std::vector<const char*> ep_keys, ep_values;
++
++    for (auto& option : provider_options) {
++      ep_keys.emplace_back(option.first.c_str());
++      ep_values.emplace_back(option.second.c_str());
++    }
++
++    // Merges provider_options into session_options.
++    Ort::ThrowOnError(Ort::api->SessionOptionsAppendExecutionProvider_V2(
++        &session_options, &GetOrtEnv(), supported_devices.data(), supported_devices.size(),
++        ep_keys.data(), ep_values.data(), ep_keys.size()));
++  }
++
++  DeviceType GetType() const override { return DeviceType::MorphiZenEP; }
++
++  void InitOrt(const OrtApi& /*api*/, Ort::Allocator& allocator) override {
++    assert(!ort_allocator_);
++    ort_allocator_ = &allocator;
++  }
++
++  Ort::Allocator& GetAllocator() override {
++    return *ort_allocator_;
++  }
++
++  std::shared_ptr<DeviceBuffer> AllocateBase(size_t size) override {
++    return std::make_shared<Memory>(size);
++  }
++
++  std::shared_ptr<DeviceBuffer> WrapMemoryBase(void* p, size_t size) override {
++    return std::make_shared<Memory>(p, size);
++  }
++
++  std::unique_ptr<Search> CreateGreedy(const GeneratorParams& params) override { return std::make_unique<GreedySearch_Cpu>(params); }
++  std::unique_ptr<Search> CreateBeam(const GeneratorParams& params) override { return std::make_unique<BeamSearch_Cpu>(params); }
++
++  void Synchronize() override {}
++
++ private:
++  std::filesystem::path ep_path_;
++};
++
++static std::unique_ptr<Interface> interface_;
++
++}  // namespace MorphiZenEP
++
++void MorphiZenEPInterface::Shutdown() {
++  MorphiZenEP::interface_.reset();
++}
++
++MorphiZenEPInterface* GetMorphiZenEPInterface() {
++  static std::once_flag once;
++
++  std::call_once(once, []() {
++    MorphiZenEP::interface_ = std::make_unique<MorphiZenEP::Interface>();
++  });
++
++  return MorphiZenEP::interface_.get();
++}
++
++}  // namespace Generators
+diff --git a/src/morphizen_ep/interface.h b/src/morphizen_ep/interface.h
+new file mode 100644
+index 0000000000..a5591fa6ef
+--- /dev/null
++++ b/src/morphizen_ep/interface.h
+@@ -0,0 +1,24 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++//
++// Modifications Copyright(C) 2026 Advanced Micro Devices, Inc. All rights reserved.
++#pragma once
++
++namespace Generators {
++
++// Memory allocated through the MorphiZen EP interface is treated as both
++// host- and device-accessible because the underlying AMD APU iGPU shares
++// physical memory with the host. Mirrors the RyzenAIInterface pattern; the
++// difference is that this provider targets OrtHardwareDeviceType_GPU + AMD
++// GPU vendor id (0x1002) instead of the NPU.
++struct MorphiZenEPInterface : DeviceInterface {
++  using ProviderOptions = std::vector<std::pair<std::string, std::string>>;
++
++  virtual void SetupProvider(OrtSessionOptions&, const ProviderOptions&) = 0;
++
++  static void Shutdown();
++};
++
++MorphiZenEPInterface* GetMorphiZenEPInterface();
++
++}  // namespace Generators
+diff --git a/src/morphizen_ep/session_options.cpp b/src/morphizen_ep/session_options.cpp
+new file mode 100644
+index 0000000000..19591c6a3c
+--- /dev/null
++++ b/src/morphizen_ep/session_options.cpp
+@@ -0,0 +1,20 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++//
++// Modifications Copyright(C) 2026 Advanced Micro Devices, Inc. All rights reserved.
++#include "session_options.h"
++#include "interface.h"
++
++namespace Generators::MorphiZenEPExecutionProvider {
++
++DeviceInterface* AppendExecutionProvider(OrtSessionOptions& session_options,
++                                         const Config::ProviderOptions& provider_options,
++                                         const Config& /*config*/,
++                                         bool /*disable_graph_capture*/) {
++  auto* device = GetDeviceInterface(DeviceType::MorphiZenEP);
++  GetMorphiZenEPInterface()->SetupProvider(session_options, provider_options.options);
++
++  return device;
++}
++
++}  // namespace Generators::MorphiZenEPExecutionProvider
+diff --git a/src/morphizen_ep/session_options.h b/src/morphizen_ep/session_options.h
+new file mode 100644
+index 0000000000..513175c9ac
+--- /dev/null
++++ b/src/morphizen_ep/session_options.h
+@@ -0,0 +1,16 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++//
++// Modifications Copyright(C) 2026 Advanced Micro Devices, Inc. All rights reserved.
++#pragma once
++
++#include "../generators.h"
++
++namespace Generators::MorphiZenEPExecutionProvider {
++
++DeviceInterface* AppendExecutionProvider(OrtSessionOptions& session_options,
++                                         const Config::ProviderOptions& provider_options,
++                                         const Config& config,
++                                         bool disable_graph_capture = false);
++
++}  // namespace Generators::MorphiZenEPExecutionProvider
+diff --git a/src/smartptrs.h b/src/smartptrs.h
+index dfd769b234..d586f8d5e8 100644
+--- a/src/smartptrs.h
++++ b/src/smartptrs.h
+@@ -95,6 +95,7 @@ enum struct DeviceType {
+   OpenVINO,
+   NvTensorRtRtx,
+   RyzenAI,
++  MorphiZenEP,
+   MAX
+ };
+ 
+
+From ca26c927099a9471eeec8c58a0b9d6be4523adc6 Mon Sep 17 00:00:00 2001
+From: shoucair <shoucair@amd.com>
+Date: Thu, 4 Jun 2026 02:39:28 -0500
+Subject: [PATCH 2/5] feat: support continuous decoding for MorphiZenEP device
+
+Add DeviceType::MorphiZenEP to the devices_supporting_continuous_decoding
+whitelist in Generator::AppendTokens. Without this entry, multiple
+AppendTokens calls without an intervening RewindToLength(0) -- as used by
+teacher-forcing PPL evaluation and any multi-turn chat workload -- throw
+'Continuous decoding is not supported on the selected device type'.
+
+MorphiZenEP's KV cache lives in UMA-pinned memory (hipHostMallocMapped)
+which is host-readable and supports the same shared-buffer KV cache
+semantics as CUDA / WEBGPU / RyzenAI. The fix mirrors the existing entries
+for those device types.
+---
+ src/generators.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/generators.cpp b/src/generators.cpp
+index 76daa6aa2e..70787d7303 100644
+--- a/src/generators.cpp
++++ b/src/generators.cpp
+@@ -475,13 +475,14 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
+ 
+   // Some models fallback to CPU for the attention operator (for example, some decoder-pipeline NPU models).
+   // Continuous decoding is supported for this case as the kv cache for such models is always on CPU.
+-  constexpr std::array<DeviceType, 6> devices_supporting_continuous_decoding{
++  constexpr std::array<DeviceType, 7> devices_supporting_continuous_decoding{
+       DeviceType::CPU,
+       DeviceType::CUDA,
+       DeviceType::WEBGPU,
+       DeviceType::OpenVINO,
+       DeviceType::NvTensorRtRtx,
+-      DeviceType::RyzenAI};
++      DeviceType::RyzenAI,
++      DeviceType::MorphiZenEP};
+ 
+   if (search_->GetSequenceLength() != 0 &&
+       std::none_of(devices_supporting_continuous_decoding.begin(), devices_supporting_continuous_decoding.end(),
+
+From 1e85eecbb76f2e30ac769d4e28bd2e718dc6ec15 Mon Sep 17 00:00:00 2001
+From: shoucair <shoucair@amd.com>
+Date: Thu, 4 Jun 2026 02:39:28 -0500
+Subject: [PATCH 3/5] feat: allocate MorphiZenEP model inputs on device memory
+
+Add DeviceType::MorphiZenEP to the input-device whitelist so model inputs (input_ids, position_ids, attention_mask, etc.) are allocated via the EP's GPU allocator instead of CPU. This lets ORT alias the buffers directly (zero H2D/D2H copies for inputs and logits); verified end-to-end on Llama-3.1-8B asym with no decode regression and ~22% faster prefill.
+
+Also restore an upstream comment in EnsureDeviceOrtInit that was inadvertently reworded.
+---
+ src/models/model.cpp | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/src/models/model.cpp b/src/models/model.cpp
+index 0cc5e7a768..516cd5d47c 100644
+--- a/src/models/model.cpp
++++ b/src/models/model.cpp
+@@ -418,11 +418,7 @@ void EnsureDeviceOrtInit(DeviceInterface& device, const Config& config) {
+ 
+   allocator.session_ = OrtSession::Create(GetOrtEnv(), g_trivial_model, sizeof(g_trivial_model), session_options.get());
+ 
+-  // Names for the device memory types used by 'OrtMemoryInfo::Create'.
+-  // The MorphiZenEP entry "MorphiZen" must match the name passed to
+-  // CreateMemoryInfo_V2 by the MorphiZen EP factory when it registers
+-  // its GPU OrtMemoryInfo via EpDevice_AddAllocatorInfo; otherwise OGA
+-  // cannot look up the EP's allocator.
++  // Names for the device memory types used by 'OrtMemoryInfo::Create'
+   static const char* device_memory_type_names[] = {"CPU (Not used, see above)", "Cuda", "DML", "WebGPU_Buf", "QnnHtpShared", "OpenVINO (Not used, see above)", "Cuda", "Cpu", "MorphiZen"};
+   static_assert(std::size(device_memory_type_names) == static_cast<size_t>(DeviceType::MAX));
+ 
+@@ -559,10 +555,10 @@ Model::Model(std::unique_ptr<Config> config) : config_{std::move(config)} {
+   CreateSessionOptions();
+   EnsureDeviceOrtInit(*p_device_, *config_);
+ 
+-  // Only CUDA, TRT-RTX, RyzenAI and DML does every input on the device
++  // Only CUDA, TRT-RTX, RyzenAI, MorphiZenEP and DML does every input on the device
+   // For WebGPU, use device memory only if graph capture is enabled, otherwise use CPU
+   if (p_device_->GetType() == DeviceType::CUDA || p_device_->GetType() == DeviceType::DML || p_device_->GetType() == DeviceType::NvTensorRtRtx ||
+-      p_device_->GetType() == DeviceType::RyzenAI ||
++      p_device_->GetType() == DeviceType::RyzenAI || p_device_->GetType() == DeviceType::MorphiZenEP ||
+       (p_device_->GetType() == DeviceType::WEBGPU && IsGraphCaptureEnabled(config_->model.decoder.session_options)))
+     p_device_inputs_ = p_device_;
+   else
+
+From 907c6835add2eaa1ada19dfcc2e3e2e70defa4f4 Mon Sep 17 00:00:00 2001
+From: shoucair <shoucair@amd.com>
+Date: Mon, 15 Jun 2026 04:51:04 -0500
+Subject: [PATCH 4/5] fix: dlclose RTLD_NOLOAD handle and add explicit includes
+ in morphizen_ep
+
+Address PR review: dlopen(RTLD_NOLOAD) still bumps the refcount of an already-loaded library, so dlclose the returned handle before returning. Also add <string>/<utility>/<vector> and smartptrs.h includes to interface.h instead of relying on transitive includes.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ src/morphizen_ep/interface.cpp | 4 +++-
+ src/morphizen_ep/interface.h   | 6 ++++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/morphizen_ep/interface.cpp b/src/morphizen_ep/interface.cpp
+index 52770261c4..e22e859a24 100644
+--- a/src/morphizen_ep/interface.cpp
++++ b/src/morphizen_ep/interface.cpp
+@@ -81,8 +81,10 @@ struct Interface : MorphiZenEPInterface {
+     if (GetModuleHandleA(ep_filename_))
+       return;
+ #else
+-    if (dlopen(ep_filename_, RTLD_NOLOAD | RTLD_NOW))
++    if (void* handle = dlopen(ep_filename_, RTLD_NOLOAD | RTLD_NOW)) {
++      dlclose(handle);
+       return;
++    }
+ #endif
+ 
+     std::error_code ec;
+diff --git a/src/morphizen_ep/interface.h b/src/morphizen_ep/interface.h
+index a5591fa6ef..756d7d11a9 100644
+--- a/src/morphizen_ep/interface.h
++++ b/src/morphizen_ep/interface.h
+@@ -4,6 +4,12 @@
+ // Modifications Copyright(C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+ #pragma once
+ 
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "../smartptrs.h"  // DeviceInterface
++
+ namespace Generators {
+ 
+ // Memory allocated through the MorphiZen EP interface is treated as both
+
+From 74b2ef21a8c229a723c1521b738eff04d08dd1d5 Mon Sep 17 00:00:00 2001
+From: zz002 <zhenzew@amd.com>
+Date: Thu, 18 Jun 2026 01:01:40 -0500
+Subject: [PATCH 5/5] feat: rename MorphiZenEP integration to AMDGPU and load
+ amdgpu-ep.dll (#12)
+
+Rename the OGA execution provider integration from MorphiZenEP to AMDGPU so it targets the AMD GPU umbrella EP (amdgpu-ep.dll) instead of loading onnxruntime_morphizen_ep.dll directly. The umbrella forwards to the HIP backend, selected via the "profile" provider option.
+
+- Rename src/morphizen_ep -> src/amdgpu and DeviceType::MorphiZenEP -> DeviceType::AMDGPU across generators.cpp, model.cpp, the session_options dispatch table, smartptrs.h, and the cmake source glob.
+- interface.cpp: register the EP as "amdgpu", load amdgpu-ep.dll (libamdgpu-ep.so), env override AMDGPU_EP_PATH. SetupProvider also mirrors provider options into ep.<name>.* session config entries since the umbrella reads them from there.
+- EnsureDeviceOrtInit: the device-init dummy session reuses the AMDGPU provider options from genai_config so the umbrella can select its backend; no profile is hardcoded.
+
+genai_config.json selects it via: "provider_options": [{ "AMDGPU": {"profile": "llm"} }]
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ cmake/global_variables.cmake                  |  4 +-
+ src/{morphizen_ep => amdgpu}/interface.cpp    | 64 +++++++++----------
+ src/{morphizen_ep => amdgpu}/interface.h      |  8 +--
+ .../session_options.cpp                       |  8 +--
+ .../session_options.h                         |  8 +--
+ src/generators.cpp                            | 14 ++--
+ src/models/model.cpp                          | 24 +++++--
+ src/models/session_options.cpp                |  4 +-
+ src/smartptrs.h                               |  2 +-
+ 9 files changed, 74 insertions(+), 62 deletions(-)
+ rename src/{morphizen_ep => amdgpu}/interface.cpp (75%)
+ rename src/{morphizen_ep => amdgpu}/interface.h (77%)
+ rename src/{morphizen_ep => amdgpu}/session_options.cpp (68%)
+ rename src/{morphizen_ep => amdgpu}/session_options.h (76%)
+
+diff --git a/cmake/global_variables.cmake b/cmake/global_variables.cmake
+index cbbc317e76..39fb90ae75 100644
+--- a/cmake/global_variables.cmake
++++ b/cmake/global_variables.cmake
+@@ -77,8 +77,8 @@ file(GLOB generator_srcs CONFIGURE_DEPENDS
+   "${GENERATORS_ROOT}/openvino/*.cpp"
+   "${GENERATORS_ROOT}/ryzenai/*.h"
+   "${GENERATORS_ROOT}/ryzenai/*.cpp"
+-  "${GENERATORS_ROOT}/morphizen_ep/*.h"
+-  "${GENERATORS_ROOT}/morphizen_ep/*.cpp"
++  "${GENERATORS_ROOT}/amdgpu/*.h"
++  "${GENERATORS_ROOT}/amdgpu/*.cpp"
+   "${GENERATORS_ROOT}/cuda/session_options.h"
+   "${GENERATORS_ROOT}/cuda/session_options.cpp"
+   "${GENERATORS_ROOT}/nvtensorrtrtx/*.h"
+diff --git a/src/morphizen_ep/interface.cpp b/src/amdgpu/interface.cpp
+similarity index 75%
+rename from src/morphizen_ep/interface.cpp
+rename to src/amdgpu/interface.cpp
+index e22e859a24..56a393a786 100644
+--- a/src/morphizen_ep/interface.cpp
++++ b/src/amdgpu/interface.cpp
+@@ -16,26 +16,25 @@
+ #endif
+ 
+ namespace Generators {
+-namespace MorphiZenEP {
++namespace AMDGPU {
+ 
+ // Mirrors ryzenai/interface.cpp. The behavioural differences are:
+-//   - ep_name_ matches the registration_name passed to morphizen's
+-//     CreateEpFactories (== "MorphiZenEP" -- what callers like
+-//     model_benchmark use with --ep_library, what genai_config.json uses
+-//     as a provider name, and what session_options.cpp's dispatch table
+-//     keys on).
++//   - ep_name_ matches the registration_name passed to amdgpu-ep's
++//     CreateEpFactories (== "amdgpu" -- what callers like model_benchmark
++//     use with --ep_library, what genai_config.json uses as a provider
++//     name, and what session_options.cpp's dispatch table keys on).
+ //   - SetupProvider filters OrtHardwareDeviceType_GPU; vendor id matching
+ //     is delegated to the EP factory's GetSupportedDevicesImpl, which
+ //     already restricts itself to AMD GPU vendor id 0x1002.
+-//   - DeviceType::MorphiZenEP is returned from GetType().
++//   - DeviceType::AMDGPU is returned from GetType().
+ //   - Allocator-backed memory is treated as both host- and device-
+ //     accessible (true on AMD APU iGPU; same simplification RyzenAI uses).
+-static constexpr auto ep_path_env_key_ = "MORPHIZEN_EP_PATH";
+-static constexpr auto ep_name_ = "MorphiZenEP";
++static constexpr auto ep_path_env_key_ = "AMDGPU_EP_PATH";
++static constexpr auto ep_name_ = "amdgpu";
+ #if defined(_WIN32)
+-static constexpr auto ep_filename_ = "onnxruntime_morphizen_ep.dll";
++static constexpr auto ep_filename_ = "amdgpu-ep.dll";
+ #else
+-static constexpr auto ep_filename_ = "libonnxruntime_morphizen_ep.so";
++static constexpr auto ep_filename_ = "libamdgpu-ep.so";
+ #endif
+ 
+ static Ort::Allocator* ort_allocator_{};
+@@ -56,7 +55,7 @@ struct Memory : DeviceBuffer {
+       ort_allocator_->Free(p_device_);
+   }
+ 
+-  const char* GetType() const override { return "MorphiZenEP"; }
++  const char* GetType() const override { return "AMDGPU"; }
+ 
+   void AllocateCpu() override {}
+   void CopyDeviceToCpu() override {}
+@@ -73,7 +72,7 @@ struct Memory : DeviceBuffer {
+   bool owned_;
+ };
+ 
+-struct Interface : MorphiZenEPInterface {
++struct Interface : AMDGPUInterface {
+   Interface() {
+     ep_path_ = ep_filename_;
+     // If the EP DLL is already loaded by the host, there is nothing to do.
+@@ -81,7 +80,7 @@ struct Interface : MorphiZenEPInterface {
+     if (GetModuleHandleA(ep_filename_))
+       return;
+ #else
+-    if (void* handle = dlopen(ep_filename_, RTLD_NOLOAD | RTLD_NOW)) {
++    if (auto handle = dlopen(ep_filename_, RTLD_NOLOAD | RTLD_NOW)) {
+       dlclose(handle);
+       return;
+     }
+@@ -115,7 +114,7 @@ struct Interface : MorphiZenEPInterface {
+ 
+     if (ep_path_.empty())
+       // Check next to onnxruntime-genai.dll.
+-      if (const auto hmod = get_hmod_for_method(GetMorphiZenEPInterface))
++      if (const auto hmod = get_hmod_for_method(GetAMDGPUInterface))
+         ep_path_ = find_next_to_module(hmod);
+ 
+     if (ep_path_.empty())
+@@ -137,8 +136,6 @@ struct Interface : MorphiZenEPInterface {
+   }
+ 
+   ~Interface() {
+-    // The EP DLL releases its singletons in DllMain on unload; there is no
+-    // equivalent of RyzenAI_Shutdown to call here.
+   }
+ 
+   void SetupProvider(OrtSessionOptions& session_options, const ProviderOptions& provider_options) override {
+@@ -156,33 +153,36 @@ struct Interface : MorphiZenEPInterface {
+         const auto* hw = Ort::api->EpDevice_Device(device);
+         if (Ort::api->HardwareDevice_Type(hw) != OrtHardwareDeviceType_GPU)
+           continue;
+-        // The morphizen factory's GetSupportedDevicesImpl already restricts
+-        // itself to AMD GPU vendor id 0x1002, so any OrtEpDevice carrying
+-        // our ep_name is by construction an AMD GPU. We deliberately do
+-        // not re-check the vendor id here so the factory can broaden its
+-        // device list in future without us having to update this filter
+-        // in lockstep.
+         supported_devices.push_back(device);
+       }
+     }
+ 
+     if (supported_devices.empty())
+-      throw std::runtime_error{"No MorphiZenEP-supported AMD GPU devices detected"};
++      throw std::runtime_error{"No AMDGPU-supported AMD GPU devices detected"};
+ 
+     std::vector<const char*> ep_keys, ep_values;
++    std::vector<std::string> config_keys;
+ 
++    // The umbrella EP reads provider options from session config entries prefixed
++    // with "ep.<name>.", so mirror them there in addition to passing them through
++    // the plugin EP V2 metadata below.
+     for (auto& option : provider_options) {
+       ep_keys.emplace_back(option.first.c_str());
+       ep_values.emplace_back(option.second.c_str());
++      config_keys.emplace_back(std::string{"ep."} + ep_name_ + "." + option.first);
++    }
++
++    for (size_t i = 0; i < config_keys.size(); ++i) {
++      Ort::ThrowOnError(Ort::api->AddSessionConfigEntry(
++          &session_options, config_keys[i].c_str(), ep_values[i]));
+     }
+ 
+-    // Merges provider_options into session_options.
+     Ort::ThrowOnError(Ort::api->SessionOptionsAppendExecutionProvider_V2(
+         &session_options, &GetOrtEnv(), supported_devices.data(), supported_devices.size(),
+         ep_keys.data(), ep_values.data(), ep_keys.size()));
+   }
+ 
+-  DeviceType GetType() const override { return DeviceType::MorphiZenEP; }
++  DeviceType GetType() const override { return DeviceType::AMDGPU; }
+ 
+   void InitOrt(const OrtApi& /*api*/, Ort::Allocator& allocator) override {
+     assert(!ort_allocator_);
+@@ -212,20 +212,20 @@ struct Interface : MorphiZenEPInterface {
+ 
+ static std::unique_ptr<Interface> interface_;
+ 
+-}  // namespace MorphiZenEP
++}  // namespace AMDGPU
+ 
+-void MorphiZenEPInterface::Shutdown() {
+-  MorphiZenEP::interface_.reset();
++void AMDGPUInterface::Shutdown() {
++  AMDGPU::interface_.reset();
+ }
+ 
+-MorphiZenEPInterface* GetMorphiZenEPInterface() {
++AMDGPUInterface* GetAMDGPUInterface() {
+   static std::once_flag once;
+ 
+   std::call_once(once, []() {
+-    MorphiZenEP::interface_ = std::make_unique<MorphiZenEP::Interface>();
++    AMDGPU::interface_ = std::make_unique<AMDGPU::Interface>();
+   });
+ 
+-  return MorphiZenEP::interface_.get();
++  return AMDGPU::interface_.get();
+ }
+ 
+ }  // namespace Generators
+diff --git a/src/morphizen_ep/interface.h b/src/amdgpu/interface.h
+similarity index 77%
+rename from src/morphizen_ep/interface.h
+rename to src/amdgpu/interface.h
+index 756d7d11a9..0abcdf9167 100644
+--- a/src/morphizen_ep/interface.h
++++ b/src/amdgpu/interface.h
+@@ -8,16 +8,16 @@
+ #include <utility>
+ #include <vector>
+ 
+-#include "../smartptrs.h"  // DeviceInterface
++#include "../smartptrs.h"
+ 
+ namespace Generators {
+ 
+-// Memory allocated through the MorphiZen EP interface is treated as both
++// Memory allocated through the AMDGPU EP interface is treated as both
+ // host- and device-accessible because the underlying AMD APU iGPU shares
+ // physical memory with the host. Mirrors the RyzenAIInterface pattern; the
+ // difference is that this provider targets OrtHardwareDeviceType_GPU + AMD
+ // GPU vendor id (0x1002) instead of the NPU.
+-struct MorphiZenEPInterface : DeviceInterface {
++struct AMDGPUInterface : DeviceInterface {
+   using ProviderOptions = std::vector<std::pair<std::string, std::string>>;
+ 
+   virtual void SetupProvider(OrtSessionOptions&, const ProviderOptions&) = 0;
+@@ -25,6 +25,6 @@ struct MorphiZenEPInterface : DeviceInterface {
+   static void Shutdown();
+ };
+ 
+-MorphiZenEPInterface* GetMorphiZenEPInterface();
++AMDGPUInterface* GetAMDGPUInterface();
+ 
+ }  // namespace Generators
+diff --git a/src/morphizen_ep/session_options.cpp b/src/amdgpu/session_options.cpp
+similarity index 68%
+rename from src/morphizen_ep/session_options.cpp
+rename to src/amdgpu/session_options.cpp
+index 19591c6a3c..d0f5267f72 100644
+--- a/src/morphizen_ep/session_options.cpp
++++ b/src/amdgpu/session_options.cpp
+@@ -5,16 +5,16 @@
+ #include "session_options.h"
+ #include "interface.h"
+ 
+-namespace Generators::MorphiZenEPExecutionProvider {
++namespace Generators::AMDGPUExecutionProvider {
+ 
+ DeviceInterface* AppendExecutionProvider(OrtSessionOptions& session_options,
+                                          const Config::ProviderOptions& provider_options,
+                                          const Config& /*config*/,
+                                          bool /*disable_graph_capture*/) {
+-  auto* device = GetDeviceInterface(DeviceType::MorphiZenEP);
+-  GetMorphiZenEPInterface()->SetupProvider(session_options, provider_options.options);
++  auto* device = GetDeviceInterface(DeviceType::AMDGPU);
++  GetAMDGPUInterface()->SetupProvider(session_options, provider_options.options);
+ 
+   return device;
+ }
+ 
+-}  // namespace Generators::MorphiZenEPExecutionProvider
++}  // namespace Generators::AMDGPUExecutionProvider
+diff --git a/src/morphizen_ep/session_options.h b/src/amdgpu/session_options.h
+similarity index 76%
+rename from src/morphizen_ep/session_options.h
+rename to src/amdgpu/session_options.h
+index 513175c9ac..bcdb72508c 100644
+--- a/src/morphizen_ep/session_options.h
++++ b/src/amdgpu/session_options.h
+@@ -4,13 +4,13 @@
+ // Modifications Copyright(C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+ #pragma once
+ 
+-#include "../generators.h"
++#include "../models/session_options.h"
+ 
+-namespace Generators::MorphiZenEPExecutionProvider {
++namespace Generators::AMDGPUExecutionProvider {
+ 
+ DeviceInterface* AppendExecutionProvider(OrtSessionOptions& session_options,
+                                          const Config::ProviderOptions& provider_options,
+                                          const Config& config,
+-                                         bool disable_graph_capture = false);
++                                         bool disable_graph_capture);
+ 
+-}  // namespace Generators::MorphiZenEPExecutionProvider
++}  // namespace Generators::AMDGPUExecutionProvider
+diff --git a/src/generators.cpp b/src/generators.cpp
+index 70787d7303..238b27a5cf 100644
+--- a/src/generators.cpp
++++ b/src/generators.cpp
+@@ -23,7 +23,7 @@
+ #include "qnn/interface.h"
+ #include "webgpu/interface.h"
+ #include "openvino/interface.h"
+-#include "morphizen_ep/interface.h"
++#include "amdgpu/interface.h"
+ #include "ryzenai/interface.h"
+ #include "engine/engine.h"
+ 
+@@ -123,7 +123,7 @@ void Shutdown() {
+   GetOrtGlobals().reset();  // Delete now because on process exit is too late
+ 
+   RyzenAIInterface::Shutdown();
+-  MorphiZenEPInterface::Shutdown();
++  AMDGPUInterface::Shutdown();
+ }
+ 
+ OrtEnv& GetOrtEnv() {
+@@ -256,8 +256,8 @@ std::string to_string(DeviceType device_type) {
+       return "NvTensorRtRtx";
+     case DeviceType::RyzenAI:
+       return "RyzenAI";
+-    case DeviceType::MorphiZenEP:
+-      return "MorphiZenEP";
++    case DeviceType::AMDGPU:
++      return "AMDGPU";
+     default:
+       throw std::runtime_error("Unknown device type");
+   }
+@@ -283,8 +283,8 @@ DeviceInterface* GetDeviceInterface(DeviceType type) {
+       return GetOpenVINOInterface();
+     case DeviceType::RyzenAI:
+       return GetRyzenAIInterface();
+-    case DeviceType::MorphiZenEP:
+-      return GetMorphiZenEPInterface();
++    case DeviceType::AMDGPU:
++      return GetAMDGPUInterface();
+   }
+ }
+ 
+@@ -482,7 +482,7 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
+       DeviceType::OpenVINO,
+       DeviceType::NvTensorRtRtx,
+       DeviceType::RyzenAI,
+-      DeviceType::MorphiZenEP};
++      DeviceType::AMDGPU};
+ 
+   if (search_->GetSequenceLength() != 0 &&
+       std::none_of(devices_supporting_continuous_decoding.begin(), devices_supporting_continuous_decoding.end(),
+diff --git a/src/models/model.cpp b/src/models/model.cpp
+index 516cd5d47c..306ecc3435 100644
+--- a/src/models/model.cpp
++++ b/src/models/model.cpp
+@@ -400,7 +400,7 @@ void EnsureDeviceOrtInit(DeviceInterface& device, const Config& config) {
+   // This ensures memory allocated on-device for model inputs/outputs is valid for the lifetime of GenAI.
+ 
+   // Names for the device types used by 'SetProviderSessionOptions'
+-  static const char* device_type_names[] = {"CPU (Not used, see above)", "cuda", "DML", "WebGPU", "QNN", "OpenVINO (Not used, see above)", "NvTensorRtRtx", "RyzenAI", "MorphiZenEP"};
++  static const char* device_type_names[] = {"CPU (Not used, see above)", "cuda", "DML", "WebGPU", "QNN", "OpenVINO (Not used, see above)", "NvTensorRtRtx", "RyzenAI", "AMDGPU"};
+   static_assert(std::size(device_type_names) == static_cast<size_t>(DeviceType::MAX));
+ 
+   // Create an OrtSessionOptions and set the options to use the DeviceType we're using here
+@@ -412,6 +412,18 @@ void EnsureDeviceOrtInit(DeviceInterface& device, const Config& config) {
+   if (type == DeviceType::QNN) {
+     provider_options_list.back().options.emplace_back("enable_htp_shared_memory_allocator", "1");
+   }
++  // The AMD GPU umbrella EP selects its backend from a "profile" provider option.
++  // The device-init dummy session has no inline options, so reuse whatever the user
++  // configured for this device in genai_config instead of hardcoding a profile.
++  if (type == DeviceType::AMDGPU) {
++    const std::string_view device_name{device_type_names[static_cast<int>(type)]};
++    for (const auto& po : config.model.decoder.session_options.provider_options) {
++      if (po.name == device_name) {
++        provider_options_list.back().options = po.options;
++        break;
++      }
++    }
++  }
+   const std::vector<std::string> providers{device_type_names[static_cast<int>(type)]};
+   SetProviderSessionOptions(*session_options, providers, provider_options_list, true, config);
+   session_options->SetLogSeverityLevel(ORT_LOGGING_LEVEL_ERROR);  // Errors only here, as warnings are not useful to the user
+@@ -419,15 +431,15 @@ void EnsureDeviceOrtInit(DeviceInterface& device, const Config& config) {
+   allocator.session_ = OrtSession::Create(GetOrtEnv(), g_trivial_model, sizeof(g_trivial_model), session_options.get());
+ 
+   // Names for the device memory types used by 'OrtMemoryInfo::Create'
+-  static const char* device_memory_type_names[] = {"CPU (Not used, see above)", "Cuda", "DML", "WebGPU_Buf", "QnnHtpShared", "OpenVINO (Not used, see above)", "Cuda", "Cpu", "MorphiZen"};
++  static const char* device_memory_type_names[] = {"CPU (Not used, see above)", "Cuda", "DML", "WebGPU_Buf", "QnnHtpShared", "OpenVINO (Not used, see above)", "Cuda", "Cpu", "AMDGPU"};
+   static_assert(std::size(device_memory_type_names) == static_cast<size_t>(DeviceType::MAX));
+ 
+   // Get the allocator from the OrtSession for the DeviceType (it's called 'AllocatorCreate' but it's really 'AllocatorGet')
+   auto name = device_memory_type_names[static_cast<int>(type)];
+   try {
+     std::unique_ptr<OrtMemoryInfo> memory_info;
+-    if (type == DeviceType::MorphiZenEP) {
+-      // MorphiZenEP exposes its allocator via the ORT plugin EP V2 API
++    if (type == DeviceType::AMDGPU) {
++      // AMDGPU EP exposes its allocator via the ORT plugin EP V2 API
+       // (CreateMemoryInfo_V2, registered through EpDevice_AddAllocatorInfo).
+       // The legacy OrtMemoryInfo::Create only knows ORT-internal device names
+       // ("Cuda", "DML", ...) and would fail with
+@@ -555,10 +567,10 @@ Model::Model(std::unique_ptr<Config> config) : config_{std::move(config)} {
+   CreateSessionOptions();
+   EnsureDeviceOrtInit(*p_device_, *config_);
+ 
+-  // Only CUDA, TRT-RTX, RyzenAI, MorphiZenEP and DML does every input on the device
++  // Only CUDA, TRT-RTX, RyzenAI, AMDGPU and DML does every input on the device
+   // For WebGPU, use device memory only if graph capture is enabled, otherwise use CPU
+   if (p_device_->GetType() == DeviceType::CUDA || p_device_->GetType() == DeviceType::DML || p_device_->GetType() == DeviceType::NvTensorRtRtx ||
+-      p_device_->GetType() == DeviceType::RyzenAI || p_device_->GetType() == DeviceType::MorphiZenEP ||
++      p_device_->GetType() == DeviceType::RyzenAI || p_device_->GetType() == DeviceType::AMDGPU ||
+       (p_device_->GetType() == DeviceType::WEBGPU && IsGraphCaptureEnabled(config_->model.decoder.session_options)))
+     p_device_inputs_ = p_device_;
+   else
+diff --git a/src/models/session_options.cpp b/src/models/session_options.cpp
+index 1133bf88d5..45fe6c8441 100644
+--- a/src/models/session_options.cpp
++++ b/src/models/session_options.cpp
+@@ -8,7 +8,7 @@
+ 
+ #include "../cuda/session_options.h"
+ #include "../dml/session_options.h"
+-#include "../morphizen_ep/session_options.h"
++#include "../amdgpu/session_options.h"
+ #include "../nvtensorrtrtx/session_options.h"
+ #include "../openvino/session_options.h"
+ #include "../qnn/session_options.h"
+@@ -154,7 +154,7 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
+       {"NvTensorRtRtx", NvTensorRtRtxExecutionProvider::AppendExecutionProvider},
+       {"OpenVINO", OpenVINOExecutionProvider::AppendExecutionProvider},
+       {"RyzenAI", RyzenAIExecutionProvider::AppendExecutionProvider},
+-      {"MorphiZenEP", MorphiZenEPExecutionProvider::AppendExecutionProvider},
++      {"AMDGPU", AMDGPUExecutionProvider::AppendExecutionProvider},
+       {"QNN", QNNExecutionProvider::AppendExecutionProvider},
+       {"VitisAI", VitisAIExecutionProvider::AppendExecutionProvider},
+       {"WebGPU", WebGPUExecutionProvider::AppendExecutionProvider},
+diff --git a/src/smartptrs.h b/src/smartptrs.h
+index d586f8d5e8..06b866a736 100644
+--- a/src/smartptrs.h
++++ b/src/smartptrs.h
+@@ -95,7 +95,7 @@ enum struct DeviceType {
+   OpenVINO,
+   NvTensorRtRtx,
+   RyzenAI,
+-  MorphiZenEP,
++  AMDGPU,
+   MAX
+ };
+ 
