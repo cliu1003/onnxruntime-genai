@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,6 +18,7 @@
 
 #include "ort_genai.h"
 
+#include "adapter_loader.h"
 #include "options.h"
 #include "resource_utils.h"
 
@@ -127,6 +130,30 @@ static std::unique_ptr<OgaGeneratorParams> MakeGeneratorParams(const benchmark::
   return params;
 }
 
+std::optional<benchmark::LoadedAdapter> LoadAdapterIfPresent(const benchmark::Options& opts) {
+  namespace fs = std::filesystem;
+  std::string adapter_path = opts.adapter_path;
+  if (adapter_path.empty()) {
+    const fs::path default_path = fs::path(opts.model_path) / "adapter.safetensors";
+    if (!fs::exists(default_path)) {
+      return std::nullopt;
+    }
+    adapter_path = default_path.string();
+  }
+
+  if (opts.verbose) {
+    std::cout << "Loading LoRA adapter weights from: " << adapter_path << "\n";
+  }
+  return benchmark::LoadSafetensors(adapter_path);
+}
+
+void BindAdapterIfPresent(OgaGenerator& generator, benchmark::BoundAdapter& bound_adapter) {
+  if (!bound_adapter.loaded) {
+    return;
+  }
+  benchmark::BindAdapterToGenerator(generator, bound_adapter);
+}
+
 void RunBenchmark(const benchmark::Options& opts) {
   std::unique_ptr<OgaModel> model;
 
@@ -176,6 +203,14 @@ void RunBenchmark(const benchmark::Options& opts) {
 
   const size_t num_tokens = num_prompt_tokens + opts.num_tokens_to_generate;
   const auto generator_params = MakeGeneratorParams(opts, *model, num_tokens);
+  const auto loaded_adapter = LoadAdapterIfPresent(opts);
+  benchmark::BoundAdapter bound_adapter{};
+  if (loaded_adapter.has_value()) {
+    bound_adapter.loaded = &loaded_adapter.value();
+    if (opts.verbose) {
+      std::cout << "Loaded " << loaded_adapter->tensors.size() << " LoRA weight tensor(s).\n";
+    }
+  }
 
   // When reuse_generator is enabled, create a single generator and reuse it for
   // prompt generation, warmup, and benchmark iterations via RewindTo(0).
@@ -184,6 +219,7 @@ void RunBenchmark(const benchmark::Options& opts) {
   std::unique_ptr<OgaGenerator> generator;
   if (opts.reuse_generator) {
     generator = OgaGenerator::Create(*model, *generator_params);
+    BindAdapterIfPresent(*generator, bound_adapter);
   }
 
   if (need_generate_prompt) {
@@ -191,6 +227,7 @@ void RunBenchmark(const benchmark::Options& opts) {
     std::unique_ptr<OgaGenerator> temp_gen;
     if (!opts.reuse_generator) {
       temp_gen = OgaGenerator::Create(*model, *generator_params);
+      BindAdapterIfPresent(*temp_gen, bound_adapter);
     }
     auto* gen = opts.reuse_generator ? generator.get() : temp_gen.get();
 
@@ -234,6 +271,7 @@ void RunBenchmark(const benchmark::Options& opts) {
       generator->RewindTo(0);
     } else {
       new_gen = OgaGenerator::Create(*model, *generator_params);
+      BindAdapterIfPresent(*new_gen, bound_adapter);
     }
     auto* gen = opts.reuse_generator ? generator.get() : new_gen.get();
 
@@ -272,6 +310,7 @@ void RunBenchmark(const benchmark::Options& opts) {
       generator->RewindTo(0);
     } else {
       new_gen = OgaGenerator::Create(*model, *generator_params);
+      BindAdapterIfPresent(*new_gen, bound_adapter);
     }
     auto* gen = opts.reuse_generator ? generator.get() : new_gen.get();
 

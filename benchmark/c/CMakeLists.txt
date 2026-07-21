@@ -5,6 +5,8 @@ set(model_benchmark_srcs
   ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/options.h
   ${CMAKE_CURRENT_SOURCE_DIR}/options.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/adapter_loader.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/adapter_loader.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/resource_utils.h
 )
 

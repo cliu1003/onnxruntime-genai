@@ -23,6 +23,7 @@ struct Options {
   bool verbose{};
   bool reuse_generator{};
   bool use_random_tokens{};
+  std::string adapter_path;
 };
 
 Options ParseOptionsFromCommandLine(int argc, const char* const* argv);

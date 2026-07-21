@@ -10,6 +10,11 @@ Example usage:
 model_benchmark -i <path to model directory>
 ```
 
+For LoRA models whose ONNX graph expects adapter weights as inputs, place
+`adapter.safetensors` (int8 weights) in the model directory or pass
+`--adapter <path>`. The benchmark binds all adapter tensors via
+`SetModelInput` before the first `AppendTokens` call.
+
 Run with `--help` to see information about additional options.
 
 Note: On some platforms, such as Android, you may need to set the environment variable `LD_LIBRARY_PATH` to the directory containing the onnxruntime shared library for `model_benchmark` to be able to run.
