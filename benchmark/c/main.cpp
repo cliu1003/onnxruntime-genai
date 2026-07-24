@@ -178,11 +178,11 @@ std::optional<benchmark::LoadedAdapter> LoadAdapterIfPresent(const benchmark::Op
   return benchmark::LoadSafetensors(adapter_path);
 }
 
-void BindAdapterIfPresent(OgaGenerator& generator, benchmark::BoundAdapter& bound_adapter) {
+void BindAdapterIfPresent(OgaGenerator& generator, benchmark::BoundAdapter& bound_adapter, const std::string& model_path) {
   if (!bound_adapter.loaded) {
     return;
   }
-  benchmark::BindAdapterToGenerator(generator, bound_adapter);
+  benchmark::BindAdapterToGenerator(generator, bound_adapter, model_path);
 }
 
 void RunBenchmark(const benchmark::Options& opts) {
@@ -258,7 +258,7 @@ void RunBenchmark(const benchmark::Options& opts) {
     if (measure_creation) {
       generator_creation_latency = Clock::now() - generator_creation_start;
     }
-    BindAdapterIfPresent(*result, bound_adapter);
+    BindAdapterIfPresent(*result, bound_adapter, opts.model_path);
     return result;
   };
 

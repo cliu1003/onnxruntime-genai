@@ -15,6 +15,11 @@ For LoRA models whose ONNX graph expects adapter weights as inputs, place
 `--adapter <path>`. The benchmark binds all adapter tensors via
 `SetModelInput` before the first `AppendTokens` call.
 
+If the model directory also contains `lora_dequant.json`, int8 adapter
+weights are dequantized to fp16 and bound using the `onnx_input` names
+from that file. This supports pure-GEMM models whose graph inputs are
+named `*.weight_fp16` while the adapter still stores `*.weight_quantized`.
+
 Run with `--help` to see information about additional options.
 
 Note: On some platforms, such as Android, you may need to set the environment variable `LD_LIBRARY_PATH` to the directory containing the onnxruntime shared library for `model_benchmark` to be able to run.
