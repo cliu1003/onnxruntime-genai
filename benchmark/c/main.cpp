@@ -147,11 +147,11 @@ std::optional<benchmark::LoadedAdapter> LoadAdapterIfPresent(const benchmark::Op
   return benchmark::LoadSafetensors(adapter_path);
 }
 
-void BindAdapterIfPresent(OgaGenerator& generator, benchmark::BoundAdapter& bound_adapter) {
+void BindAdapterIfPresent(OgaGenerator& generator, benchmark::BoundAdapter& bound_adapter, const std::string& model_path) {
   if (!bound_adapter.loaded) {
     return;
   }
-  benchmark::BindAdapterToGenerator(generator, bound_adapter);
+  benchmark::BindAdapterToGenerator(generator, bound_adapter, model_path);
 }
 
 void RunBenchmark(const benchmark::Options& opts) {
@@ -219,7 +219,7 @@ void RunBenchmark(const benchmark::Options& opts) {
   std::unique_ptr<OgaGenerator> generator;
   if (opts.reuse_generator) {
     generator = OgaGenerator::Create(*model, *generator_params);
-    BindAdapterIfPresent(*generator, bound_adapter);
+    BindAdapterIfPresent(*generator, bound_adapter, opts.model_path);
   }
 
   if (need_generate_prompt) {
@@ -227,7 +227,7 @@ void RunBenchmark(const benchmark::Options& opts) {
     std::unique_ptr<OgaGenerator> temp_gen;
     if (!opts.reuse_generator) {
       temp_gen = OgaGenerator::Create(*model, *generator_params);
-      BindAdapterIfPresent(*temp_gen, bound_adapter);
+      BindAdapterIfPresent(*temp_gen, bound_adapter, opts.model_path);
     }
     auto* gen = opts.reuse_generator ? generator.get() : temp_gen.get();
 
@@ -271,7 +271,7 @@ void RunBenchmark(const benchmark::Options& opts) {
       generator->RewindTo(0);
     } else {
       new_gen = OgaGenerator::Create(*model, *generator_params);
-      BindAdapterIfPresent(*new_gen, bound_adapter);
+      BindAdapterIfPresent(*new_gen, bound_adapter, opts.model_path);
     }
     auto* gen = opts.reuse_generator ? generator.get() : new_gen.get();
 
@@ -310,7 +310,7 @@ void RunBenchmark(const benchmark::Options& opts) {
       generator->RewindTo(0);
     } else {
       new_gen = OgaGenerator::Create(*model, *generator_params);
-      BindAdapterIfPresent(*new_gen, bound_adapter);
+      BindAdapterIfPresent(*new_gen, bound_adapter, opts.model_path);
     }
     auto* gen = opts.reuse_generator ? generator.get() : new_gen.get();
 
