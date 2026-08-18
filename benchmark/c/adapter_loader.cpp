@@ -387,9 +387,9 @@ LoadedAdapter LoadSafetensors(const std::string& path) {
   adapter.tensors.reserve(parsed_tensors.size());
 
   for (const auto& parsed : parsed_tensors) {
-    if (parsed.dtype != "I8") {
+    if (parsed.dtype != "I8" && parsed.dtype != "U8") {
       throw std::runtime_error("Unsupported safetensors dtype for LoRA weight '" + parsed.name +
-                               "': " + parsed.dtype + " (only I8/int8 is supported)");
+                               "': " + parsed.dtype + " (only I8/U8 supported)");
     }
     if (parsed.data_offsets.size() != 2) {
       throw std::runtime_error("Invalid safetensors data_offsets for tensor: " + parsed.name);
@@ -405,10 +405,16 @@ LoadedAdapter LoadSafetensors(const std::string& path) {
     LoadedAdapterTensor tensor{};
     tensor.name = parsed.name;
     tensor.shape = parsed.shape;
-    tensor.data.resize(byte_count);
+    tensor.is_uint8 = parsed.dtype == "U8";
 
     input.seekg(data_section_offset + static_cast<std::streamoff>(data_start), std::ios::beg);
-    input.read(reinterpret_cast<char*>(tensor.data.data()), static_cast<std::streamsize>(byte_count));
+    if (tensor.is_uint8) {
+      tensor.u8_data.resize(byte_count);
+      input.read(reinterpret_cast<char*>(tensor.u8_data.data()), static_cast<std::streamsize>(byte_count));
+    } else {
+      tensor.data.resize(byte_count);
+      input.read(reinterpret_cast<char*>(tensor.data.data()), static_cast<std::streamsize>(byte_count));
+    }
     if (!input) {
       throw std::runtime_error("Failed to read safetensors tensor data for: " + parsed.name);
     }
@@ -467,6 +473,16 @@ void BindAdapterToGenerator(OgaGenerator& generator, BoundAdapter& bound_adapter
         bound_adapter.ort_tensors.push_back(std::move(ort_tensor));
         continue;
       }
+    }
+
+    if (tensor.is_uint8) {
+      auto ort_tensor = OgaTensor::Create(
+          const_cast<uint8_t*>(tensor.u8_data.data()),
+          tensor.shape,
+          OgaElementType_uint8);
+      generator.SetModelInput(tensor.name.c_str(), *ort_tensor);
+      bound_adapter.ort_tensors.push_back(std::move(ort_tensor));
+      continue;
     }
 
     auto ort_tensor = OgaTensor::Create(

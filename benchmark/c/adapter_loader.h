@@ -18,6 +18,8 @@ namespace benchmark {
 struct LoadedAdapterTensor {
   std::string name;
   std::vector<int8_t> data;
+  std::vector<uint8_t> u8_data;
+  bool is_uint8{false};
   std::vector<int64_t> shape;
 };
 
