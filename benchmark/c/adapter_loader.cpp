@@ -387,9 +387,9 @@ LoadedAdapter LoadSafetensors(const std::string& path) {
   adapter.tensors.reserve(parsed_tensors.size());
 
   for (const auto& parsed : parsed_tensors) {
-    if (parsed.dtype != "I8" && parsed.dtype != "U8") {
+    if (parsed.dtype != "I8" && parsed.dtype != "U8" && parsed.dtype != "F16") {
       throw std::runtime_error("Unsupported safetensors dtype for LoRA weight '" + parsed.name +
-                               "': " + parsed.dtype + " (only I8/U8 supported)");
+                               "': " + parsed.dtype + " (only I8/U8/F16 supported)");
     }
     if (parsed.data_offsets.size() != 2) {
       throw std::runtime_error("Invalid safetensors data_offsets for tensor: " + parsed.name);
@@ -406,9 +406,16 @@ LoadedAdapter LoadSafetensors(const std::string& path) {
     tensor.name = parsed.name;
     tensor.shape = parsed.shape;
     tensor.is_uint8 = parsed.dtype == "U8";
+    tensor.is_fp16 = parsed.dtype == "F16";
 
     input.seekg(data_section_offset + static_cast<std::streamoff>(data_start), std::ios::beg);
-    if (tensor.is_uint8) {
+    if (tensor.is_fp16) {
+      if (byte_count % sizeof(uint16_t) != 0) {
+        throw std::runtime_error("Invalid safetensors fp16 byte size for tensor: " + parsed.name);
+      }
+      tensor.f16_data.resize(byte_count / sizeof(uint16_t));
+      input.read(reinterpret_cast<char*>(tensor.f16_data.data()), static_cast<std::streamsize>(byte_count));
+    } else if (tensor.is_uint8) {
       tensor.u8_data.resize(byte_count);
       input.read(reinterpret_cast<char*>(tensor.u8_data.data()), static_cast<std::streamsize>(byte_count));
     } else {
@@ -473,6 +480,16 @@ void BindAdapterToGenerator(OgaGenerator& generator, BoundAdapter& bound_adapter
         bound_adapter.ort_tensors.push_back(std::move(ort_tensor));
         continue;
       }
+    }
+
+    if (tensor.is_fp16) {
+      auto ort_tensor = OgaTensor::Create(
+          const_cast<uint16_t*>(tensor.f16_data.data()),
+          tensor.shape,
+          OgaElementType_float16);
+      generator.SetModelInput(tensor.name.c_str(), *ort_tensor);
+      bound_adapter.ort_tensors.push_back(std::move(ort_tensor));
+      continue;
     }
 
     if (tensor.is_uint8) {
