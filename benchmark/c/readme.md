@@ -11,14 +11,15 @@ model_benchmark -i <path to model directory>
 ```
 
 For LoRA models whose ONNX graph expects adapter weights as inputs, place
-`adapter.safetensors` (int8 weights) in the model directory or pass
+`adapter.safetensors` in the model directory or pass
 `--adapter <path>`. The benchmark binds all adapter tensors via
 `SetModelInput` before the first `AppendTokens` call.
 
-If the model directory also contains `lora_dequant.json`, int8 adapter
-weights are dequantized to fp16 and bound using the `onnx_input` names
-from that file. This supports pure-GEMM models whose graph inputs are
-named `*.weight_fp16` while the adapter still stores `*.weight_quantized`.
+Folded Gemm LoRA exports use fp16 weights keyed by `*.weight_fp16`.
+MatMulNBits LoRA exports use packed uint8 weights keyed by `*.weight_quantized`.
+
+If the model directory contains a legacy `lora_dequant.json`, int8 adapter
+weights listed there are dequantized to fp16 at load time (older exports).
 
 Run with `--help` to see information about additional options.
 

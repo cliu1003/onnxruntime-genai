@@ -19,7 +19,9 @@ struct LoadedAdapterTensor {
   std::string name;
   std::vector<int8_t> data;
   std::vector<uint8_t> u8_data;
+  std::vector<uint16_t> f16_data;
   bool is_uint8{false};
+  bool is_fp16{false};
   std::vector<int64_t> shape;
 };
 
