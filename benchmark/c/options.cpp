@@ -30,7 +30,7 @@ namespace {
     << "    -i,--input_folder <path>\n"
     << "      Path to the ONNX model directory to benchmark, compatible with onnxruntime-genai.\n"
     << "    --adapter <path>\n"
-    << "      Path to LoRA adapter.safetensors with int8 graph-input weights.\n"
+    << "      Path to LoRA adapter.safetensors (int8, packed uint8, or fp16 graph-input weights).\n"
     << "      Default: <model_dir>/adapter.safetensors if that file exists.\n"
     << "    -e,--execution_provider <provider>\n"
     << "      Execution provider to use. Valid values are: cpu, cuda, dml, NvTensorRtRtx. Default: " << defaults.execution_provider << "\n"

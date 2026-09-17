@@ -5,11 +5,7 @@
 
 #include <charconv>
 #include <cctype>
-#include <cstring>
-#include <cstdlib>
-#include <filesystem>
 #include <fstream>
-#include <numeric>
 #include <stdexcept>
 #include <string_view>
 
@@ -90,33 +86,6 @@ void SkipJsonValue(std::string_view header, size_t& pos) {
   }
 }
 
-double ParseJsonNumber(std::string_view json, size_t& pos) {
-  SkipWhitespace(json, pos);
-  const size_t start = pos;
-  if (pos < json.size() && (json[pos] == '-' || json[pos] == '+')) {
-    ++pos;
-  }
-  while (pos < json.size()) {
-    const char c = json[pos];
-    if (std::isdigit(static_cast<unsigned char>(c)) || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
-      ++pos;
-    } else {
-      break;
-    }
-  }
-  if (start == pos) {
-    throw std::runtime_error("Expected JSON number.");
-  }
-
-  const std::string number_string(json.substr(start, pos - start));
-  char* end = nullptr;
-  const double value = std::strtod(number_string.c_str(), &end);
-  if (end != number_string.c_str() + number_string.size()) {
-    throw std::runtime_error("Failed to parse JSON number: " + number_string);
-  }
-  return value;
-}
-
 std::vector<int64_t> ParseInt64Array(std::string_view header, size_t& pos) {
   if (pos >= header.size() || header[pos] != '[') {
     throw std::runtime_error("Expected JSON array.");
@@ -156,86 +125,6 @@ std::vector<int64_t> ParseInt64Array(std::string_view header, size_t& pos) {
     throw std::runtime_error("Malformed JSON array.");
   }
   throw std::runtime_error("Unterminated JSON array.");
-}
-
-LoraDequantEntry ParseLoraDequantEntry(std::string_view json, size_t& pos) {
-  SkipWhitespace(json, pos);
-  if (pos >= json.size() || json[pos] != '{') {
-    throw std::runtime_error("Expected JSON object in lora_dequant.json.");
-  }
-  ++pos;
-
-  LoraDequantEntry entry{};
-  while (pos < json.size()) {
-    SkipWhitespace(json, pos);
-    if (pos < json.size() && json[pos] == '}') {
-      ++pos;
-      break;
-    }
-
-    const std::string field = ParseJsonString(json, pos);
-    SkipWhitespace(json, pos);
-    if (pos >= json.size() || json[pos] != ':') {
-      throw std::runtime_error("Malformed lora_dequant.json entry.");
-    }
-    ++pos;
-    SkipWhitespace(json, pos);
-
-    if (field == "onnx_input") {
-      entry.onnx_input = ParseJsonString(json, pos);
-    } else if (field == "scale") {
-      entry.scale = static_cast<float>(ParseJsonNumber(json, pos));
-    } else if (field == "zero_point") {
-      entry.zero_point = static_cast<int32_t>(ParseJsonNumber(json, pos));
-    } else {
-      SkipJsonValue(json, pos);
-    }
-
-    SkipWhitespace(json, pos);
-    if (pos < json.size() && json[pos] == ',') {
-      ++pos;
-    }
-  }
-
-  if (entry.onnx_input.empty()) {
-    throw std::runtime_error("lora_dequant.json entry is missing onnx_input.");
-  }
-  return entry;
-}
-
-LoraDequantMap ParseLoraDequantMap(std::string_view json) {
-  LoraDequantMap map;
-  size_t pos = 0;
-  SkipWhitespace(json, pos);
-  if (pos >= json.size() || json[pos] != '{') {
-    throw std::runtime_error("lora_dequant.json must be a JSON object.");
-  }
-  ++pos;
-
-  while (pos < json.size()) {
-    SkipWhitespace(json, pos);
-    if (pos < json.size() && json[pos] == '}') {
-      ++pos;
-      break;
-    }
-
-    const std::string key = ParseJsonString(json, pos);
-    SkipWhitespace(json, pos);
-    if (pos >= json.size() || json[pos] != ':') {
-      throw std::runtime_error("Malformed lora_dequant.json entry.");
-    }
-    ++pos;
-    SkipWhitespace(json, pos);
-
-    map.emplace(key, ParseLoraDequantEntry(json, pos));
-
-    SkipWhitespace(json, pos);
-    if (pos < json.size() && json[pos] == ',') {
-      ++pos;
-    }
-  }
-
-  return map;
 }
 
 struct ParsedSafetensorsTensor {
@@ -321,46 +210,6 @@ std::vector<ParsedSafetensorsTensor> ParseSafetensorsHeader(std::string_view hea
   return tensors;
 }
 
-size_t ElementCountFromShape(std::span<const int64_t> shape) {
-  if (shape.empty()) {
-    return 0;
-  }
-  return static_cast<size_t>(std::accumulate(shape.begin(), shape.end(), int64_t{1}, std::multiplies<int64_t>{}));
-}
-
-uint16_t Float32ToFloat16(float value) {
-  uint32_t bits{};
-  std::memcpy(&bits, &value, sizeof(bits));
-  bits += 0x00001000;
-
-  const uint32_t exponent = (bits & 0x7F800000) >> 23;
-  const uint32_t mantissa = bits & 0x007FFFFF;
-  return static_cast<uint16_t>((bits & 0x80000000) >> 16 |
-                               (exponent > 112) * ((((exponent - 112) << 10) & 0x7C00) | mantissa >> 13) |
-                               ((exponent < 113) & (exponent > 101)) * ((((0x007FF000 + mantissa) >> (125 - exponent)) + 1) >> 1) |
-                               (exponent > 143) * 0x7FFF);
-}
-
-DequantizedAdapterTensor DequantizeAdapterTensor(const LoadedAdapterTensor& tensor, const LoraDequantEntry& entry) {
-  const size_t element_count = ElementCountFromShape(tensor.shape);
-  if (element_count != tensor.data.size()) {
-    throw std::runtime_error("LoRA weight '" + tensor.name + "' shape does not match int8 data size.");
-  }
-
-  DequantizedAdapterTensor dequantized{};
-  dequantized.name = entry.onnx_input;
-  dequantized.shape = tensor.shape;
-  dequantized.data.resize(element_count);
-
-  const float scale = entry.scale;
-  const float zero_point = static_cast<float>(entry.zero_point);
-  for (size_t i = 0; i < element_count; ++i) {
-    const float fp32 = (static_cast<float>(tensor.data[i]) - zero_point) * scale;
-    dequantized.data[i] = Float32ToFloat16(fp32);
-  }
-  return dequantized;
-}
-
 }  // namespace
 
 LoadedAdapter LoadSafetensors(const std::string& path) {
@@ -436,52 +285,15 @@ LoadedAdapter LoadSafetensors(const std::string& path) {
   return adapter;
 }
 
-std::optional<LoraDequantMap> LoadLoraDequantMap(const std::string& model_path) {
-  namespace fs = std::filesystem;
-  const fs::path path = fs::path(model_path) / "lora_dequant.json";
-  if (!fs::exists(path)) {
-    return std::nullopt;
-  }
-
-  std::ifstream input{path};
-  if (!input) {
-    throw std::runtime_error("Failed to open lora_dequant.json: " + path.string());
-  }
-
-  const std::string content((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-  return ParseLoraDequantMap(content);
-}
-
-void BindAdapterToGenerator(OgaGenerator& generator, BoundAdapter& bound_adapter, const std::string& model_path) {
+void BindAdapterToGenerator(OgaGenerator& generator, BoundAdapter& bound_adapter) {
   if (!bound_adapter.loaded) {
     return;
   }
 
   bound_adapter.ort_tensors.clear();
-  bound_adapter.dequantized_tensors.clear();
   bound_adapter.ort_tensors.reserve(bound_adapter.loaded->tensors.size());
 
-  const auto dequant_map = LoadLoraDequantMap(model_path);
-  if (dequant_map.has_value()) {
-    bound_adapter.dequantized_tensors.reserve(bound_adapter.loaded->tensors.size());
-  }
-
   for (const auto& tensor : bound_adapter.loaded->tensors) {
-    if (dequant_map.has_value()) {
-      const auto it = dequant_map->find(tensor.name);
-      if (it != dequant_map->end()) {
-        bound_adapter.dequantized_tensors.push_back(DequantizeAdapterTensor(tensor, it->second));
-        auto& dequantized = bound_adapter.dequantized_tensors.back();
-        auto ort_tensor = OgaTensor::Create(
-            dequantized.data.data(),
-            dequantized.shape,
-            OgaElementType_float16);
-        generator.SetModelInput(dequantized.name.c_str(), *ort_tensor);
-        bound_adapter.ort_tensors.push_back(std::move(ort_tensor));
-        continue;
-      }
-    }
-
     if (tensor.is_fp16) {
       auto ort_tensor = OgaTensor::Create(
           const_cast<uint16_t*>(tensor.f16_data.data()),
