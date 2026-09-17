@@ -15,11 +15,9 @@ For LoRA models whose ONNX graph expects adapter weights as inputs, place
 `--adapter <path>`. The benchmark binds all adapter tensors via
 `SetModelInput` before the first `AppendTokens` call.
 
-Folded Gemm LoRA exports use fp16 weights keyed by `*.weight_fp16`.
+Folded Gemm LoRA exports use fp16 weights keyed by `*.weight_fp16`, or int8
+weights keyed by `*.weight_quantized` (file and graph input are both int8).
 MatMulNBits LoRA exports use packed uint8 weights keyed by `*.weight_quantized`.
-
-If the model directory contains a legacy `lora_dequant.json`, int8 adapter
-weights listed there are dequantized to fp16 at load time (older exports).
 
 Run with `--help` to see information about additional options.
 
