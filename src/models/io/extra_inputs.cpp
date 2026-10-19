@@ -1,6 +1,6 @@
 #include "generator/generators.h"
-#include "models/io/extra_inputs.h"
 #include "models/model.h"
+#include "models/io/extra_inputs.h"
 #include "models/utils.h"
 
 namespace Generators {
